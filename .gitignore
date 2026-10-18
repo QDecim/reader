@@ -1,0 +1,12 @@
+*.iml
+.gradle/
+build/
+local.properties
+.idea/
+app/libs/*.aar
+app/src/main/assets/models/
+
+*.wav
+tools/st2/*
+!tools/st2/*.py
+
