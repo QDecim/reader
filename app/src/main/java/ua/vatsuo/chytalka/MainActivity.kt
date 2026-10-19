@@ -82,6 +82,8 @@ class MainActivity : ComponentActivity() {
                 picker.launch(arrayOf("application/x-fictionbook+xml", "application/epub+zip", "text/plain", "application/octet-stream", "*/*"))
             }) { Text(if (s.title.isEmpty()) "Відкрити книгу (FB2 / EPUB / TXT)" else s.title) }
 
+            OutlinedButton(onClick = { startActivity(Intent(this@MainActivity, ua.vatsuo.chytalka.bench.BenchActivity::class.java)) }) { Text("Тест StyleTTS2") }
+
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Sel("Системний", s.engine == EngineKind.SYSTEM) { PlayerService.send(this@MainActivity, PlayerService.ENGINE, 0) }
                 Sel("Piper (офлайн)", s.engine == EngineKind.PIPER) { PlayerService.send(this@MainActivity, PlayerService.ENGINE, 1) }

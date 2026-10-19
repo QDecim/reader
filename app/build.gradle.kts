@@ -23,6 +23,8 @@ android {
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
     androidResources { noCompress += listOf("onnx") }
+    // sherpa-onnx AAR (ORT 1.28.2) and onnxruntime-android both ship libonnxruntime.so; the C API version is 28 for all 1.28.x
+    packaging { jniLibs { pickFirsts += "**/libonnxruntime.so" } }
 }
 
 dependencies {
@@ -34,4 +36,5 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.28.0") // StyleTTS2 benchmark (Java API)
 }
