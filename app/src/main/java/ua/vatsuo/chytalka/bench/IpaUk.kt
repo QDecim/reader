@@ -63,8 +63,9 @@ object IpaUk {
         "дждж" to "джː", "дздз" to "дзː"
     ).map { (a, b) -> Sub(Regex(a), py(b)) }
 
-    private val wsRe = Regex("(?U)\\s+")
-    private val splitRe = Regex("(?U)[\\s\\-]+")
+    // Android regex = ICU: no (?U) flag, \\s is already Unicode-aware there
+    private val wsRe = Regex("\\s+")
+    private val splitRe = Regex("[\\s\\-]+")
 
     private val s01 = sub("""([aɛiɪuɔ])([ˈˌ])""", """\2\1""")
     private val sPal1 = sub("(" + PALATALIZABLE_C + ")([ː]?)([ˈˌ⁀]?)i", """\1ʲ\2\3i""")

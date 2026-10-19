@@ -6,6 +6,7 @@ import android.content.IntentFilter
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Debug
+import android.os.SystemClock
 import android.os.PowerManager
 import java.io.File
 import java.io.Writer
@@ -56,34 +57,60 @@ class Thermal(ctx: Context, private val onChange: (String) -> Unit) {
     }
 }
 
-/** Every [periodS] seconds writes battery/thermal/memory to the samples CSV. */
+/**
+ * Reads battery current every second (integrated into mAh: the charge counter of some phones only moves in 1% steps),
+ * and writes a CSV row every [rowEvery] seconds: battery/thermal/memory.
+ */
 class Sampler(
     private val battery: Battery, private val thermal: Thermal, private val out: Writer,
-    private val t0Nanos: Long, private val periodS: Long = 5,
+    private val t0Nanos: Long, private val rowEvery: Int = 5,
 ) {
     private val ex = Executors.newSingleThreadScheduledExecutor()
     val charges = CopyOnWriteArrayList<Long>()
+    private val absRaw = ArrayList<Double>()          // |CURRENT_NOW| every second, raw units (guarded by this)
+    private var prevRaw = 0.0; private var prevNs = 0L
+    private var integRaw = 0.0                        // raw units * seconds
+    private var winSum = 0.0; private var winN = 0
+    private var ticks = 0
     @Volatile var maxTemp = Float.NEGATIVE_INFINITY; private set
     @Volatile var peakHwmMb = 0.0; private set
     @Volatile var peakPssMb = 0.0; private set
 
-    init { out.write(Csv.row("t_s", "charge_uah", "current_ua", "pct", "temp_c", "thermal", "vmhwm_mb", "native_pss_mb") + "\n") }
+    init { out.write(Csv.row("t_s", "charge_uah", "current_ua", "current_avg_raw", "pct", "temp_c", "thermal", "vmhwm_mb", "native_pss_mb") + "\n") }
 
-    fun start() { ex.scheduleAtFixedRate({ runCatching { sample() } }, 0, periodS, TimeUnit.SECONDS) }
+    fun start() { ex.scheduleAtFixedRate({ runCatching { tick(false) } }, 0, 1, TimeUnit.SECONDS) }
 
-    @Synchronized fun sample() {
-        val t = (System.nanoTime() - t0Nanos) / 1e9
-        val c = battery.chargeUah(); val temp = battery.tempC()
-        val hwm = Mem.vmHwmMb(); val pss = Mem.nativePssMb()
-        charges.add(c)
-        if (temp > maxTemp) maxTemp = temp
-        if (hwm > peakHwmMb) peakHwmMb = hwm
-        if (pss > peakPssMb) peakPssMb = pss
-        out.write(Csv.row(t, c, battery.currentUa(), battery.pct(), temp, Thermal.name(thermal.status()), hwm, pss) + "\n")
-        out.flush()
+    @Synchronized private fun tick(last: Boolean) {
+        val now = SystemClock.elapsedRealtimeNanos()
+        var cur = battery.currentUa()
+        if (cur == Long.MIN_VALUE || cur == Int.MIN_VALUE.toLong()) cur = 0   // "not supported"
+        val raw = Math.abs(cur.toDouble())
+        if (prevNs != 0L) integRaw += (prevRaw + raw) / 2 * ((now - prevNs) / 1e9)
+        prevRaw = raw; prevNs = now
+        absRaw.add(raw); winSum += raw; winN++
+        val c = battery.chargeUah(); charges.add(c)
+        if (last || ticks % rowEvery == 0) {
+            val temp = battery.tempC(); val hwm = Mem.vmHwmMb(); val pss = Mem.nativePssMb()
+            if (temp > maxTemp) maxTemp = temp
+            if (hwm > peakHwmMb) peakHwmMb = hwm
+            if (pss > peakPssMb) peakPssMb = pss
+            val avg = if (winN > 0) winSum / winN else 0.0
+            winSum = 0.0; winN = 0
+            out.write(Csv.row((now - t0Nanos) / 1e9, c, cur, avg, battery.pct(), temp, Thermal.name(thermal.status()), hwm, pss) + "\n")
+            out.flush()
+        }
+        ticks++
     }
 
-    fun stop() { ex.shutdownNow(); ex.awaitTermination(2, TimeUnit.SECONDS); runCatching { sample() } }
+    fun stop() { ex.shutdownNow(); ex.awaitTermination(2, TimeUnit.SECONDS); runCatching { tick(true) } }
+
+    /** true if CURRENT_NOW looks like mA (see CurrentMath) */
+    @Synchronized fun milli(): Boolean = CurrentMath.isMilli(absRaw)
+    @Synchronized fun hasCurrent(): Boolean = absRaw.any { it > 0 }
+    /** charge drawn since start, from the integrated current, mAh */
+    @Synchronized fun mAh(): Double = CurrentMath.mAh(integRaw, CurrentMath.isMilli(absRaw))
+    /** average current over [wallS] seconds, mA */
+    fun avgMa(wallS: Double): Double = if (wallS <= 0) Double.NaN else mAh() * 3600.0 / wallS
 
     /** smallest non-zero change of the charge counter = its effective granularity (µAh) */
     fun granularityUah(): Long = charges.zipWithNext { a, b -> Math.abs(a - b) }.filter { it > 0 }.minOrNull() ?: 0L

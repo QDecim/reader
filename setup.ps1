@@ -1,15 +1,37 @@
 # Run once in the project root: powershell -ExecutionPolicy Bypass -File setup.ps1
 # ASCII-only on purpose: Windows PowerShell 5.1 misreads UTF-8 files without BOM.
 $ErrorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $root = $PSScriptRoot; $ver = "1.13.8"
 $base = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
 New-Item -ItemType Directory -Force "$root\app\libs" | Out-Null
 $aar = "$root\app\libs\sherpa-onnx-$ver.aar"
 if (-not (Test-Path $aar)) { Write-Host "Downloading AAR..."; Invoke-WebRequest "$base/v$ver/sherpa-onnx-$ver.aar" -OutFile $aar }
-# Windows tar cannot decompress .bz2 (no bzip2 binary), so use Python or 7-Zip instead.
-function Expand-Bz2($file, $outDir) {
+function Find-Python {
   $py = Get-Command python -ErrorAction SilentlyContinue
   if (-not $py) { $py = Get-Command py -ErrorAction SilentlyContinue }
+  return $py
+}
+# onnxruntime for the StyleTTS2 benchmark (Java API). sherpa-onnx has its own libonnxruntime.so with other symbol
+# versions, so the Maven copy is renamed (libortjruntime.so) and its JNI lib is pointed at it. See tools/ort_android.py.
+$ortVer = "1.28.0"
+$ortSo = "$root\app\src\main\jniLibs\arm64-v8a\libortjruntime.so"
+$ortJni = "$root\app\src\main\jniLibs\arm64-v8a\libonnxruntime4j_jni.so"
+$ortJar = "$root\app\libs\onnxruntime-classes.jar"
+if (-not ((Test-Path $ortSo) -and (Test-Path $ortJni) -and (Test-Path $ortJar))) {
+  $py = Find-Python
+  if (-not $py) { throw "Need Python (3.6+) to prepare onnxruntime" }
+  $ortAar = Join-Path $env:TEMP "onnxruntime-android-$ortVer.aar"
+  if (-not (Test-Path $ortAar)) {
+    Write-Host "Downloading onnxruntime-android $ortVer..."
+    Invoke-WebRequest "https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/$ortVer/onnxruntime-android-$ortVer.aar" -OutFile $ortAar
+  }
+  & $py.Source "$root\tools\ort_android.py" $ortAar "$root\app"
+  if ($LASTEXITCODE -ne 0) { throw "tools/ort_android.py failed" }
+}
+# Windows tar cannot decompress .bz2 (no bzip2 binary), so use Python or 7-Zip instead.
+function Expand-Bz2($file, $outDir) {
+  $py = Find-Python
   if ($py) { & $py.Source -c "import tarfile,sys; tarfile.open(sys.argv[1]).extractall(sys.argv[2])" $file $outDir; return }
   $z = Get-Command 7z -ErrorAction SilentlyContinue
   if (-not $z -and (Test-Path "C:\Program Files\7-Zip\7z.exe")) { $z = Get-Command "C:\Program Files\7-Zip\7z.exe" }

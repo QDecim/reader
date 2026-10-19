@@ -4,6 +4,11 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// Fail early with a clear message instead of an UnsatisfiedLinkError on the phone.
+val ortFiles = listOf("libs/onnxruntime-classes.jar", "src/main/jniLibs/arm64-v8a/libortjruntime.so", "src/main/jniLibs/arm64-v8a/libonnxruntime4j_jni.so")
+val ortMissing = ortFiles.filter { !file(it).exists() }
+if (ortMissing.isNotEmpty()) throw GradleException("Missing $ortMissing: run setup.ps1 (it prepares onnxruntime for the StyleTTS2 benchmark)")
+
 android {
     namespace = "ua.vatsuo.chytalka"
     compileSdk = 34
@@ -23,12 +28,11 @@ android {
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
     androidResources { noCompress += listOf("onnx") }
-    // sherpa-onnx AAR (ORT 1.28.2) and onnxruntime-android both ship libonnxruntime.so; the C API version is 28 for all 1.28.x
-    packaging { jniLibs { pickFirsts += "**/libonnxruntime.so" } }
 }
 
 dependencies {
     implementation(fileTree("libs") { include("*.aar") }) // sherpa-onnx (run setup.ps1)
+    implementation(fileTree("libs") { include("*.jar") }) // ORT Java classes only; native libs are patched copies in src/main/jniLibs (tools/ort_android.py)
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("androidx.activity:activity-compose:1.9.2")
@@ -36,5 +40,4 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.28.0") // StyleTTS2 benchmark (Java API)
 }

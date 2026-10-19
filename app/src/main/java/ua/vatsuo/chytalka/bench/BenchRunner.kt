@@ -1,6 +1,8 @@
 package ua.vatsuo.chytalka.bench
 
 import android.content.Context
+import android.os.PowerManager
+import android.os.SystemClock
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.provider.Settings
@@ -15,6 +17,8 @@ import ua.vatsuo.chytalka.Lang
 import ua.vatsuo.chytalka.Player
 import java.io.BufferedWriter
 import java.io.File
+import java.io.PrintWriter
+import java.io.StringWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -32,6 +36,7 @@ class BenchRunner(private val ctx: Context, private val cfg: BenchConfig, privat
     private val sentFile = File(outDir, "bench_$stamp.csv")
     private val sampFile = File(outDir, "bench_${stamp}_samples.csv")
     private val sumFile = File(outDir, "bench_${stamp}_summary.txt")
+    private val errFile = File(outDir, "bench_${stamp}_error.txt")
     private val prefs = ctx.getSharedPreferences("chytalka_bench", Context.MODE_PRIVATE)
     private val battery = Battery(ctx)
     private val thermal = Thermal(ctx) { log(it) }
@@ -40,14 +45,17 @@ class BenchRunner(private val ctx: Context, private val cfg: BenchConfig, privat
     private lateinit var samp: BufferedWriter
     private var sampler: Sampler? = null
     private var t0 = 0L
+    private var upt0 = 0L   // uptimeMillis at start: does not count deep sleep, elapsedRealtime does
     private var chargeStart = 0L; private var pctStart = 0; private var tempStart = 0f
     private val rows = ArrayList<Row>()
     private var totalAudioS = 0.0
     private var modelLoadS = Double.NaN
     private val extra = ArrayList<String>()   // mode-specific summary lines
+    private var error: String? = null
+    private var prevHandler: Thread.UncaughtExceptionHandler? = null
 
     private fun log(s: String) = BenchState.log(s)
-    private fun now() = (System.nanoTime() - t0) / 1e9
+    private fun now() = (SystemClock.elapsedRealtimeNanos() - t0) / 1e9   // real time, also while the CPU sleeps
     private fun sentences(n: Int): List<Item> {
         val s = Player.state.value
         val from = s.index.coerceIn(0, maxOf(0, s.items.lastIndex))
@@ -67,6 +75,8 @@ class BenchRunner(private val ctx: Context, private val cfg: BenchConfig, privat
         } catch (e: Throwable) {
             Log.e("ChytalkaBench", "fail", e)
             log("ПОМИЛКА: ${e.javaClass.simpleName}: ${e.message}")
+            val sw = StringWriter(); e.printStackTrace(PrintWriter(sw))
+            error = "${e.javaClass.name}: ${e.message}\n$sw"
         } finally {
             finish()
         }
@@ -77,11 +87,19 @@ class BenchRunner(private val ctx: Context, private val cfg: BenchConfig, privat
         sent = sentFile.bufferedWriter(); samp = sampFile.bufferedWriter()
         sent.write(Csv.row("mode", "t_s", "run", "chapter", "idx", "chars", "tokens", "audio_s", "tok_s", "inf_s", "enc_s",
             "rtf_inf", "rtf_total", "threads", "provider", "voice") + "\n")
+        prefs.edit().putString("unfinished_stamp", stamp).putString("unfinished_mode", cfg.mode.label).putInt("unfinished_cap", cfg.capacityMah).apply()
+        prevHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            runCatching { errFile.writeText("Необроблений виняток у потоці ${t.name}:\n" + StringWriter().also { w -> e.printStackTrace(PrintWriter(w)) }) }
+            prevHandler?.uncaughtException(t, e)
+        }
+        if (!ctx.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(ctx.packageName))
+            log("УВАГА: для застосунку ввімкнена оптимізація батареї: система може вбити тест при вимкненому екрані (кнопка на екрані тесту)")
         if (battery.plugged()) log("УВАГА: підключено зарядку: вимір батареї недійсний")
         if (Settings.Global.getInt(ctx.contentResolver, Settings.Global.AIRPLANE_MODE_ON, 0) == 0) log("УВАГА: режим польоту вимкнений")
         log("Старт: ${cfg.mode.label}; заряд ${battery.pct()}%, ${"%.1f".format(battery.tempC())}°C")
         thermal.start()
-        t0 = System.nanoTime()
+        t0 = SystemClock.elapsedRealtimeNanos(); upt0 = SystemClock.uptimeMillis()
         chargeStart = battery.chargeUah(); pctStart = battery.pct(); tempStart = battery.tempC()
         sampler = Sampler(battery, thermal, samp, t0).also { it.start() }
     }
@@ -92,16 +110,23 @@ class BenchRunner(private val ctx: Context, private val cfg: BenchConfig, privat
         val chargeEnd = battery.chargeUah(); val pctEnd = battery.pct()
         val text = buildSummary(wall, chargeEnd, pctEnd, s)
         runCatching { sent.close() }; runCatching { samp.close() }
+        error?.let { runCatching { errFile.writeText(it) } }
         sumFile.writeText(text)
+        prefs.edit().remove("unfinished_stamp").apply()
+        Thread.setDefaultUncaughtExceptionHandler(prevHandler)
         text.lines().forEach { log(it) }
-        BenchState.ui.update { it.copy(summary = text, files = listOf(sentFile, sampFile, sumFile).filter { f -> f.exists() }.map { f -> f.absolutePath }) }
-        log("Файли: ${sentFile.name}, ${sampFile.name}, ${sumFile.name}")
+        BenchState.ui.update { it.copy(summary = text, files = listOf(sentFile, sampFile, sumFile, errFile).filter { f -> f.exists() }.map { f -> f.absolutePath }) }
+        log("Файли: ${sentFile.name}, ${sampFile.name}, ${sumFile.name}" + if (errFile.exists()) ", ${errFile.name}" else "")
     }
 
     private fun buildSummary(wall: Double, chargeEnd: Long, pctEnd: Int, s: Sampler?): String {
         val sb = StringBuilder()
         sb.appendLine("=== ПІДСУМОК ${cfg.mode.label} (${cfg.provider}, потоки ${cfg.threads}) ===")
+        error?.let { sb.appendLine("!! ПОМИЛКА: " + it.lines().first()); sb.appendLine("   (стек у bench_${stamp}_error.txt)") }
         sb.appendLine("Wall: %.1f с (%.1f хв)".format(wall, wall / 60))
+        val awake = (SystemClock.uptimeMillis() - upt0) / 1000.0
+        if (wall - awake > maxOf(5.0, wall * 0.03)) sb.appendLine("!! Процесор спав %.0f с із %.0f с (wake lock не втримав): вимір струму зайвий".format(wall - awake, wall))
+        else sb.appendLine("Процесор не засинав (прокинутий %.0f з %.0f с)".format(awake, wall))
         if (!modelLoadS.isNaN()) sb.appendLine("Завантаження моделі: %.2f с".format(modelLoadS))
         if (rows.isNotEmpty()) {
             val r = rows.map { it.rtfInf }
@@ -116,24 +141,23 @@ class BenchRunner(private val ctx: Context, private val cfg: BenchConfig, privat
         }
         extra.forEach { sb.appendLine(it) }
         val used = chargeStart - chargeEnd
-        sb.appendLine("Батарея: %d%% -> %d%%, лічильник %d -> %d мкА·год (Δ %d), крок лічильника ~%d".format(
-            pctStart, pctEnd, chargeStart, chargeEnd, used, s?.granularityUah() ?: 0L))
+        val gran = s?.granularityUah() ?: 0L
+        sb.appendLine("Батарея: %d%% -> %d%%, лічильник %d -> %d мкА·год (Δ %d), крок лічильника ~%d".format(pctStart, pctEnd, chargeStart, chargeEnd, used, gran))
+        val haveCur = s?.hasCurrent() == true
+        val mAh = if (haveCur) s!!.mAh() else Double.NaN
+        if (haveCur) sb.appendLine("Струм (інтеграл, 1 с): одиниці %s (авто), середній %.0f мА, разом %.1f мА·год".format(if (s!!.milli()) "мА" else "мкА", s.avgMa(wall), mAh))
+        else sb.appendLine("Струм: CURRENT_NOW недоступний на цьому телефоні")
         sb.appendLine("Темп.: %.1f -> макс %.1f °C; макс. термо-статус: %s".format(tempStart, s?.maxTemp ?: Float.NaN, Thermal.name(thermal.maxStatus)))
         sb.appendLine("Пам'ять: піковий VmHWM %.0f МБ, native PSS (пік) %.0f МБ".format(s?.peakHwmMb ?: Double.NaN, s?.peakPssMb ?: Double.NaN))
-        val bgRate = prefs.getFloat("bg_uah_per_min", Float.NaN)
+        val bgMa = prefs.getFloat("bg_ma", Float.NaN).toDouble()
         if ((cfg.mode == BenchMode.BATCH || cfg.mode == BenchMode.PIPER) && totalAudioS > 0) {
-            val wallMin = wall / 60
-            val bg = if (bgRate.isNaN()) 0.0 else bgRate * wallMin
-            val net = used - bg
-            val hours = totalAudioS / 3600
-            val mAhPerHour = net / 1000.0 / hours
-            sb.appendLine("Фон (режим C): " + if (bgRate.isNaN()) "немає, спершу зробіть C (віднімання пропущено)" else "%.1f мкА·год/хв × %.1f хв = %.0f мкА·год".format(bgRate, wallMin, bg))
-            sb.appendLine("ГОЛОВНЕ ЧИСЛО: %.0f мА·год на годину аудіо".format(mAhPerHour))
-            if (cfg.capacityMah > 0) {
-                val pct = mAhPerHour / cfg.capacityMah * 100
-                sb.appendLine("= %.1f%% ємності (%d мА·год) на годину аудіо; поріг ≤10%%: %s".format(pct, cfg.capacityMah, if (pct <= 10) "ПРОЙДЕНО" else "НЕ пройдено"))
-            } else sb.appendLine("Вкажіть ємність батареї, щоб порівняти з порогом 10%")
-            if (used < 3 * (s?.granularityUah() ?: 0L) || used <= 0) sb.appendLine("!! Δ лічильника замала/нульова: вимір ненадійний, подовжте прогін")
+            if (haveCur) Energy.lines(mAh, wall, totalAudioS, bgMa, cfg.capacityMah).forEach { sb.appendLine(it) }
+            else sb.appendLine("!! Без струму головне число недоступне")
+            // cross-check with the charge counter (only if it moves in fine steps)
+            val counterOk = gran > 0 && used >= 3 * gran
+            if (counterOk) sb.appendLine("Звірка за лічильником: %.0f мА·год на годину аудіо (без віднімання фону)".format(used / 1000.0 / (totalAudioS / 3600)))
+            else sb.appendLine("Лічильник заряду: крок завеликий/Δ замала, за ним вимір ненадійний (на цьому телефоні він змінюється кроками по 1%)")
+            if (haveCur && wall < 600) sb.appendLine("!! Прогін коротший за 10 хв: результат орієнтовний, подовжте (більше розділів)")
         }
         return sb.toString().trimEnd()
     }
@@ -269,14 +293,14 @@ class BenchRunner(private val ctx: Context, private val cfg: BenchConfig, privat
 
     // ---------------------------------------------------------------- C: idle baseline
     private fun modeIdle() {
-        log("Простій ${cfg.minutes} хв: вимкніть екран і нічого не чіпайте")
+        log("Простій ${cfg.minutes} хв: вимкніть екран і нічого не чіпайте (не закривайте застосунок свайпом)")
         waitMinutes(cfg.minutes)
-        val used = chargeStart - battery.chargeUah(); val min = now() / 60
-        if (!stop.get() && min > 1) {
-            val rate = used.toFloat() / min.toFloat()
-            prefs.edit().putFloat("bg_uah_per_min", rate).putFloat("bg_minutes", min.toFloat()).apply()
-            extra.add("ФОН: %.1f мкА·год/хв (%.1f мА·год/год), збережено для віднімання".format(rate, rate * 60 / 1000))
-        }
+        val min = now() / 60
+        val avg = sampler?.avgMa(now()) ?: Double.NaN
+        if (min >= 3 && !avg.isNaN() && avg > 0) {
+            prefs.edit().putFloat("bg_ma", avg.toFloat()).putFloat("bg_minutes", min.toFloat()).apply()
+            extra.add("ФОН: середній струм %.0f мА за %.1f хв, збережено для віднімання в B/E".format(avg, min))
+        } else extra.add("ФОН не збережено (потрібно ≥3 хв і доступний струм)")
     }
 
     // ---------------------------------------------------------------- D: playback baseline
@@ -290,17 +314,16 @@ class BenchRunner(private val ctx: Context, private val cfg: BenchConfig, privat
             mp.setDataSource(f.path); mp.isLooping = true; mp.prepare(); mp.start()
             waitMinutes(cfg.minutes)
         } finally { runCatching { mp.stop() }; mp.release() }
-        val used = chargeStart - battery.chargeUah(); val min = now() / 60
-        if (min > 1) {
-            val rate = used.toFloat() / min.toFloat(); val bg = prefs.getFloat("bg_uah_per_min", Float.NaN)
-            extra.add("Відтворення: %.1f мкА·год/хв; чисте (мінус фон): %s".format(rate, if (bg.isNaN()) "н/д (нема режиму C)" else "%.1f мкА·год/хв".format(rate - bg)))
-        }
+        val min = now() / 60
+        val avg = sampler?.avgMa(now()) ?: Double.NaN
+        val bg = prefs.getFloat("bg_ma", Float.NaN).toDouble()
+        if (min > 1 && !avg.isNaN()) extra.add("Відтворення: середній струм %.0f мА; чисте (мінус фон C): %s".format(avg, if (bg.isNaN()) "н/д (нема режиму C)" else "%.0f мА".format(avg - bg)))
     }
 
     private fun waitMinutes(m: Int) {
-        val end = System.nanoTime() + m * 60_000_000_000L
+        val end = SystemClock.elapsedRealtimeNanos() + m * 60_000_000_000L
         var nextLog = 1
-        while (System.nanoTime() < end && !stop.get()) {
+        while (SystemClock.elapsedRealtimeNanos() < end && !stop.get()) {
             Thread.sleep(500)
             if (now() / 60 >= nextLog) { log("минуло $nextLog хв, заряд ${battery.pct()}%, лічильник ${battery.chargeUah()}"); nextLog++ }
         }

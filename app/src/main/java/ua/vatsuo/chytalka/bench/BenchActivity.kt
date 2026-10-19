@@ -1,7 +1,10 @@
 package ua.vatsuo.chytalka.bench
 
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
@@ -28,6 +31,15 @@ class BenchActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent { MaterialTheme(colorScheme = darkColorScheme()) { Screen() } }
+        Thread { runCatching { BenchRecovery.check(applicationContext) } }.start()
+    }
+
+    private fun ignoringBattery() = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+
+    private fun allowBackground() {
+        runCatching {
+            startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+        }.onFailure { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))) }
     }
 
     private fun share(paths: List<String>) {
@@ -46,6 +58,7 @@ class BenchActivity : ComponentActivity() {
         val voices = remember(refresh) { BenchFiles.voices(dir) }
         val hasModel = remember(refresh) { BenchFiles.model(dir).exists() }
         val vocabSrc = remember(refresh) { BenchFiles.vocabSource(dir) }
+        val battOk = remember(refresh) { ignoringBattery() }
 
         var mode by remember { mutableStateOf(BenchMode.LATENCY) }
         var threads by remember { mutableStateOf(setOf(4)) }
@@ -81,7 +94,11 @@ class BenchActivity : ComponentActivity() {
                     "книга: ${if (book.items.isEmpty()) "не відкрита (відкрийте на головному екрані)" else "${book.title}, укр. речень $ukCount, поточне №${book.index + 1}"}",
                 color = Color.Gray, fontSize = 12.sp
             )
-            OutlinedButton(onClick = { refresh++ }) { Text("Оновити перевірку файлів") }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { refresh++ }) { Text("Оновити перевірку") }
+                OutlinedButton(onClick = { allowBackground() }) { Text(if (battOk) "Фон дозволено ✓" else "Дозволити фон") }
+            }
+            if (!battOk) Text("Без «Дозволити фон» (не оптимізувати батарею) OnePlus може вбити тест при вимкненому екрані. Також закріпіть застосунок у недавніх (замок) і не закривайте його свайпом.", color = Color(0xFFFF8866), fontSize = 12.sp)
 
             Text("Режим", color = Color.Gray)
             FlowRowSel(BenchMode.values().toList(), { it == mode }, { it.label }) { mode = it }
@@ -120,7 +137,7 @@ class BenchActivity : ComponentActivity() {
                     BenchService.start(this@BenchActivity)
                 }) { Text("Старт") }
                 OutlinedButton(enabled = ui.running, onClick = { BenchService.stop(this@BenchActivity) }) { Text("Стоп") }
-                OutlinedButton(enabled = ui.files.isNotEmpty() && !ui.running, onClick = { share(ui.files) }) { Text("Поділитись") }
+                OutlinedButton(enabled = ui.files.isNotEmpty() && !ui.running, onClick = { share(ui.files) }) { Text("Поділитись останнім") }
             }
             if (!ready) Text("Не готово: перевірте файли/книгу вище", color = Color(0xFFFF8866), fontSize = 12.sp)
 
@@ -136,7 +153,8 @@ class BenchActivity : ComponentActivity() {
                 "Протокол: режим польоту; НЕ на зарядці (USB-зарядка псує вимір; файли забирайте після тесту через adb по Wi-Fi або «Поділитись»); " +
                     "заряд 40–90%; 10 хв охолодження між прогонами; кожен прогін ≥10–15 хв; мінімум 2 повтори. " +
                     "Порядок: C (простій, екран вимкнений) → B (пакет) → D (відтворення). " +
-                    "Під час C/D/B вимкніть екран кнопкою живлення. Результати: Android/data/ua.vatsuo.chytalka/files/bench_*.csv",
+                    "Під час C/D/B вимкніть екран кнопкою живлення. Якщо тест вбито системою, при наступному відкритті цього екрана підсумок відновиться з CSV і з'явиться «Поділитись останнім». " +
+                    "Результати: Android/data/ua.vatsuo.chytalka/files/bench_*.csv",
                 color = Color.Gray, fontSize = 11.sp
             )
         }
